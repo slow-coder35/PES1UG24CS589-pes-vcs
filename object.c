@@ -94,35 +94,149 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    const char *type_str;
+    char header[64];
+    unsigned char *buf;
+    size_t header_len, total_len;
+    char path[512], dir[512], temp[512];
+    char hex[HASH_HEX_SIZE + 1];
+    int fd, dirfd;
+    ssize_t written;
+
+    if (type == OBJ_BLOB) type_str = "blob";
+    else if (type == OBJ_TREE) type_str = "tree";
+    else type_str = "commit";
+
+    header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
+    total_len = header_len + len;
+
+    buf = malloc(total_len);
+    if (!buf) return -1;
+
+    memcpy(buf, header, header_len);
+    memcpy(buf + header_len, data, len);
+
+    compute_hash(buf, total_len, id_out);
+
+    if (object_exists(id_out)) {
+        free(buf);
+        return 0;
+    }
+
+    hash_to_hex(id_out, hex);
+
+    snprintf(dir, sizeof(dir), "%s/%.2s", OBJECTS_DIR, hex);
+    mkdir(OBJECTS_DIR, 0755);
+    mkdir(dir, 0755);
+
+    object_path(id_out, path, sizeof(path));
+    snprintf(temp, sizeof(temp), "%s/tmpXXXXXX", dir);
+
+    fd = mkstemp(temp);
+    if (fd < 0) {
+        free(buf);
+        return -1;
+    }
+
+    written = write(fd, buf, total_len);
+    if (written != (ssize_t)total_len) {
+        close(fd);
+        unlink(temp);
+        free(buf);
+        return -1;
+    }
+
+    fsync(fd);
+    close(fd);
+
+    if (rename(temp, path) != 0) {
+        unlink(temp);
+        free(buf);
+        return -1;
+    }
+
+    dirfd = open(dir, O_RDONLY);
+    if (dirfd >= 0) {
+        fsync(dirfd);
+        close(dirfd);
+    }
+
+    free(buf);
+    return 0;
 }
 
-// Read an object from the store.
-//
-// Steps:
-//   1. Build the file path from the hash using object_path()
-//   2. Open and read the entire file
-//   3. Parse the header to extract the type string and size
-//   4. Verify integrity: recompute the SHA-256 of the file contents
-//      and compare to the expected hash (from *id). Return -1 if mismatch.
-//   5. Set *type_out to the parsed ObjectType
-//   6. Allocate a buffer, copy the data portion (after the \0), set *data_out and *len_out
-//
-// HINTS - Useful syscalls and functions for this phase:
-//   - object_path        : getting the target file path
-//   - fopen, fread, fseek: reading the file into memory
-//   - memchr             : safely finding the '\0' separating header and data
-//   - strncmp            : parsing the type string ("blob", "tree", "commit")
-//   - compute_hash       : re-hashing the read data for integrity verification
-//   - memcmp             : comparing the computed hash against the requested hash
-//   - malloc, memcpy     : allocating and returning the extracted data
-//
-// The caller is responsible for calling free(*data_out).
-// Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    char path[512];
+    FILE *fp;
+    unsigned char *buf;
+    long file_size;
+    char *nul;
+    char type_str[16];
+    size_t size;
+    ObjectID check;
+
+    object_path(id, path, sizeof(path));
+
+    fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    fseek(fp, 0, SEEK_END);
+    file_size = ftell(fp);
+    rewind(fp);
+
+    if (file_size <= 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    buf = malloc(file_size);
+    if (!buf) {
+        fclose(fp);
+        return -1;
+    }
+
+    if (fread(buf, 1, file_size, fp) != (size_t)file_size) {
+        fclose(fp);
+        free(buf);
+        return -1;
+    }
+
+    fclose(fp);
+
+    compute_hash(buf, file_size, &check);
+    if (memcmp(check.hash, id->hash, HASH_SIZE) != 0) {
+        free(buf);
+        return -1;
+    }
+
+    nul = memchr(buf, '\0', file_size);
+    if (!nul) {
+        free(buf);
+        return -1;
+    }
+
+    if (sscanf((char *)buf, "%15s %zu", type_str, &size) != 2) {
+        free(buf);
+        return -1;
+    }
+
+    if (strcmp(type_str, "blob") == 0) *type_out = OBJ_BLOB;
+    else if (strcmp(type_str, "tree") == 0) *type_out = OBJ_TREE;
+    else if (strcmp(type_str, "commit") == 0) *type_out = OBJ_COMMIT;
+    else {
+        free(buf);
+        return -1;
+    }
+
+    *data_out = malloc(size);
+    if (!*data_out) {
+        free(buf);
+        return -1;
+    }
+
+    memcpy(*data_out, nul + 1, size);
+    *len_out = size;
+
+    free(buf);
+    return 0;
 }
